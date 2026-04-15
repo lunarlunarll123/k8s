@@ -1,0 +1,244 @@
+# -------------------
+# Namespace
+# -------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop-demo
+
+---
+# ==========================================
+# DATABASE LAYER (Redis)
+# ==========================================
+
+# --- Product DB (Redis A) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-redis
+  namespace: shop-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-redis
+  template:
+    metadata:
+      labels:
+        app: product-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:alpine
+        ports:
+        - containerPort: 6379
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-redis  # Code connects to this DNS name
+  namespace: shop-demo
+spec:
+  ports:
+  - port: 6379
+  selector:
+    app: product-redis
+
+---
+# --- Order DB (Redis B) ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-redis
+  namespace: shop-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-redis
+  template:
+    metadata:
+      labels:
+        app: order-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:alpine
+        ports:
+        - containerPort: 6379
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-redis # Code connects to this DNS name
+  namespace: shop-demo
+spec:
+  ports:
+  - port: 6379
+  selector:
+    app: order-redis
+
+---
+# ==========================================
+# APPLICATION LAYER (Python Apps)
+# ==========================================
+
+# --- Product Service ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-app
+  namespace: shop-demo
+spec:
+  replicas: 3  # [SCALING] Start with 3 instances immediately!
+  selector:
+    matchLabels:
+      app: product-app
+  template:
+    metadata:
+      labels:
+        app: product-app
+    spec:
+      containers:
+      - name: product-app
+        image: shop-product:v1  # Local image we will build
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5000
+        env:
+        - name: FLASK_ENV
+          value: "development"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service # Internal DNS name
+  namespace: shop-demo
+spec:
+  ports:
+  - port: 5000
+  selector:
+    app: product-app
+
+---
+# --- Order Service ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-app
+  namespace: shop-demo
+spec:
+  replicas: 2 # [SCALING] Start with 2 instances
+  selector:
+    matchLabels:
+      app: order-app
+  template:
+    metadata:
+      labels:
+        app: order-app
+    spec:
+      containers:
+      - name: order-app
+        image: shop-order:v1 # Local image we will build
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5000
+        env:
+        - name: FLASK_ENV
+          value: "development"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service # Internal DNS name
+  namespace: shop-demo
+spec:
+  ports:
+  - port: 5000
+  selector:
+    app: order-app
+
+---
+# ==========================================
+# GATEWAY LAYER (Nginx)
+# ==========================================
+
+# 1. ConfigMap (Stores nginx.conf)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: shop-demo
+data:
+  nginx.conf: |
+    events { worker_connections 1024; }
+    http {
+        upstream product_backend {
+            # K8s Service DNS
+            server product-service:5000;
+        }
+        upstream order_backend {
+            # K8s Service DNS
+            server order-service:5000;
+        }
+        server {
+            listen 80;
+            
+            location /product/ {
+                proxy_pass http://product_backend/;
+            }
+            location /order/ {
+                proxy_pass http://order_backend/;
+            }
+        }
+    }
+
+---
+# 2. Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-gateway
+  namespace: shop-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-gateway
+  template:
+    metadata:
+      labels:
+        app: nginx-gateway
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+      volumes:
+      - name: config-volume
+        configMap:
+          name: nginx-config
+
+---
+# 3. Service (External Access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-entrypoint
+  namespace: shop-demo
+spec:
+  type: LoadBalancer  # Exposes IP outside the cluster
+  ports:
+  - port: 8080        # Browser Port
+    targetPort: 80    # Container Port
+  selector:
+    app: nginx-gateway
